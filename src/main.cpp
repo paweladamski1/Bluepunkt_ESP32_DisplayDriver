@@ -27,6 +27,7 @@ float currentTemp = 0;
 // main functions to set display
 void setOutdoorDisplay(int num);
 void setOutdoorDisplay(const String &data);
+void setOutdoorDisplay_animate(int idx);
 
 // www handlers
 void server_handleRoot();
@@ -35,9 +36,16 @@ void server_handleSet();
 // heldpers for open-drain signaling
 inline void setPinLow(int pin);
 void initPins();
+inline void setDataBit(uint8_t bit);
+inline void setPinHigh(int pin);
+inline void pulseClock();
+void pulseLatch();
+
 void sendBitsArray(const bool *digit1, const bool *digit2, bool minus, bool celsius);
 float getOutdoorTemperature();
 
+
+//-------------------------------------------------------------------------------------------------------
 
 /// ===== Arduino setup / loop =====
 /// @brief Arduino setup function
@@ -66,11 +74,12 @@ void setup()
 /// @brief Arduino main loop
 void loop()
 {
+  static int currentTemp = 0;
+  static unsigned long lastTempRead = 0;
+  const unsigned long TEMP_INTERVAL_MS = 30000; // 30 s
   static int animate_idx = 0;
   server.handleClient();
-
   unsigned long now = millis();
-
   if (now - lastTempRead >= TEMP_INTERVAL_MS)
   {
     lastTempRead = now;
@@ -155,16 +164,16 @@ void setOutdoorDisplay(int num)
 void setOutdoorDisplay(const String &data)
 {
   // send NULL display
-  switch (data[0])
+  if(data == "NULL")
   {
-  case 'NULL':
     sendBitsArray(DIGIT_1[DISPLAY_NULL_IDX], DIGIT_2[DISPLAY_NULL_IDX], false, true);
-    break;
-  case '--':
+    return;
+  } 
+  // send -- display
+  if(data == "--")
+  {
     sendBitsArray(DIGIT_1[DISPLAY_SIGN_MINUS_IDX], DIGIT_2[DISPLAY_SIGN_MINUS_IDX], false, true);
-    break;
-  default:
-    sendBitsArray(DIGIT_1[DISPLAY_NULL_IDX], DIGIT_2[DISPLAY_NULL_IDX], false, true);
+    return;
   }
 }
 
@@ -175,6 +184,7 @@ void setOutdoorDisplay_animate(int idx)
   sendBitsArray(DIGIT_1[idx + 12], DIGIT_2[idx + 12], false, false);
 }
 
+/// @brief Handle root (/) request
 void server_handleRoot()
 {
   String html =
@@ -214,6 +224,7 @@ void server_handleRoot()
   server.send(200, "text/html", html);
 }
 
+/// @brief Handle /set request to set temperature (for test)
 void server_handleSet()
 {
   if (!server.hasArg("temp"))
@@ -237,13 +248,15 @@ void server_handleSet()
   server.send(302);
 }
 
-// ----- open-drain helpers -----
+/// @brief Set a pin to LOW (drive line low)
+/// @param pin  Pin number
 inline void setPinLow(int pin)
 {
   pinMode(pin, OUTPUT);
   digitalWrite(pin, LOW);
 }
-
+/// @brief Set a pin to high-Z (pull-up will pull line HIGH)
+/// @param pin  Pin number
 inline void setPinHigh(int pin)
 {
   pinMode(pin, INPUT); // high-Z, pull-up will pull line HIGH
@@ -295,13 +308,8 @@ void initPins()
   setPinHigh(PIN_LATCH);
 }
 
-const unsigned long TEMP_INTERVAL_MS = 10000; // 10 s
-unsigned long lastTempRead = 0;
-
-unsigned long lastSend = 0;
-const unsigned long SEND_INTERVAL_MS = 100;
-int TestNumber = -99;
-
+/// @brief Get outdoor temperature from HTTP server
+/// @return Temperature in Celsius or negative error code <= -100
 float getOutdoorTemperature()
 {
   if (WiFi.status() != WL_CONNECTED)
