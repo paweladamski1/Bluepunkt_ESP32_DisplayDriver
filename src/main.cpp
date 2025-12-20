@@ -1,106 +1,104 @@
-#include <Arduino.h>
-
 // ESP32 OPEN-DRAIN DRIVER for OUTDOOR display (16-bit frames)
-// Pins used: CLOCK -> GPIO26, LATCH -> GPIO25, DATA -> GPIO33
+// Pins used: CLOCK -> GPIO4, LATCH -> GPIO2, DATA -> GPIO3
 // Open-drain emulation: OUTPUT LOW to pull line low, INPUT to release (pull-up pulls HIGH)
-// Adjust BIT_ON_HIGH if logic is inverted (1 means LED ON when line is HIGH).
+// BIT_ON_HIGH = true means bit==1 -> LINE HIGH (LED ON), bit==0 -> LINE LOW (LED OFF)
 
-const int PIN_CLOCK = 26;
-const int PIN_DATA = 33;
-const int PIN_LATCH = 25;
+#include <Arduino.h>
+#include <HTTPClient.h>
+#include <WiFi.h>
+#include <WebServer.h>
 
-// timing (tunable)
-const unsigned int T_HALF_US = 5; // half clock period in microseconds (5 -> ~100 kHz)
+#include "wifi_pass.h"
+#include "outdoor_symbols.h"
 
-// If true: bit==1 => LINE HIGH (release), bit==0 => LINE LOW (drive low).
-// If false: invert (bit==1 => drive low).
-bool BIT_ON_HIGH = true;
-
-// example frames for digits 0-9
-bool frame1[11][7] = {
-    {1, 1, 1, 1, 1, 0, 1}, // 0
-    {0, 0, 0, 0, 1, 0, 1}, // 1
-    {1, 1, 0, 1, 1, 1, 0}, // 2 ok
-    {1, 0, 0, 1, 1, 1, 1}, // 3 ok
-    {0, 0, 1, 0, 1, 1, 1}, // 4 ok
-    {1, 0, 1, 1, 0, 1, 1}, // 5 ok
-    {1, 1, 1, 1, 0, 1, 1}, // 6 ok
-    {0, 0, 0, 1, 1, 0, 1}, // 7 ok
-    {1, 1, 1, 1, 1, 1, 1}, // 8
-    {1, 0, 1, 1, 1, 1, 1}, // 9   
-    {0, 0, 0, 0, 0, 0, 0}  // NULL
-
- };
-
- bool frame2[11][7] = {
-    {1, 1, 1, 1, 0, 1, 1}, // 0
-    {0, 0, 0, 0, 0, 1, 1}, // 1
-    {1, 0, 1, 1, 1, 1, 0}, // 2 ok
-    {0, 0, 1, 1, 1, 1, 1}, // 3 
-    {0, 1, 0, 0, 1, 1, 1}, // 4 ok
-    {0, 1, 1, 1, 1, 0, 1}, // 5 
-    {1, 1, 1, 1, 1, 0, 1}, // 6 
-    {0, 0, 1, 0, 0, 1, 1}, // 7 ok
-    {1, 1, 1, 1, 1, 1, 1}, // 8
-    {0, 1, 1, 1, 1, 1, 1}, // 9   
-    {0, 0, 0, 0, 0, 0, 0}  // NULL
-
-
- };
+// Pin definitions
+const int PIN_LATCH = 2; // green
+const int PIN_DATA = 3;  // blue
+const int PIN_CLOCK = 4; // yellow
  
-// ----- open-drain helpers -----
-inline void pinLow(int pin)
+
+// ===== HTTP server =====
+WebServer server(80);
+
+// ===== Temperature read interval =====
+// actual temperature to display
+float currentTemp = 0;
+
+// main functions to set display
+void setOutdoorDisplay(int num);
+void setOutdoorDisplay(const String &data);
+
+// www handlers
+void server_handleRoot();
+void server_handleSet();
+
+// heldpers for open-drain signaling
+inline void setPinLow(int pin);
+void initPins();
+void sendBitsArray(const bool *digit1, const bool *digit2, bool minus, bool celsius);
+float getOutdoorTemperature();
+
+
+/// ===== Arduino setup / loop =====
+/// @brief Arduino setup function
+void setup()
 {
-  pinMode(pin, OUTPUT);
-  digitalWrite(pin, LOW);
+  initPins();
+  delay(200);
+  WiFi.setHostname("esp_lcd_01");
+  WiFi.begin(SSID, PASSWORD);
+  server.on("/", server_handleRoot);
+  server.on("/set", server_handleSet);
+  server.begin();
+
+  int attempt = 0;
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    delay(500);
+    attempt++;
+    if (attempt % 2 == 0)
+      setOutdoorDisplay("NULL");
+    else
+      setOutdoorDisplay("--");
+  }
 }
-inline void pinHigh(int pin)
+
+/// @brief Arduino main loop
+void loop()
 {
-  pinMode(pin, INPUT); // high-Z, pull-up will pull line HIGH
+  static int animate_idx = 0;
+  server.handleClient();
+
+  unsigned long now = millis();
+
+  if (now - lastTempRead >= TEMP_INTERVAL_MS)
+  {
+    lastTempRead = now;
+
+    float t = getOutdoorTemperature();
+    if (t >= -60.0f && t <= 99.0f)
+    {
+      currentTemp = (int)t;
+      animate_idx = 0;
+      setOutdoorDisplay(currentTemp);
+    }
+    else
+    {
+      setOutdoorDisplay_animate(animate_idx);
+      animate_idx = (animate_idx + 1) % 6;
+    }
+  }
 }
 
-// set data line according to logical bit and BIT_ON_HIGH polarity
-inline void setDataBit(uint8_t bit)
-{
-  bool wantHigh = (bit != 0) ? BIT_ON_HIGH : !BIT_ON_HIGH;
-  if (wantHigh)
-    pinHigh(PIN_DATA);
-  else
-    pinLow(PIN_DATA);
-}
-
-// Pulse clock once (open-drain)
-inline void pulseClock()
-{
-  pinHigh(PIN_CLOCK);
-  delayMicroseconds(T_HALF_US);
-  pinLow(PIN_CLOCK);
-  delayMicroseconds(T_HALF_US);
-}
-
-// Latch pulse: observed as a short HIGH pulse (we emulate by releasing latch briefly)
-void pulseLatch()
-{
-  // ensure latch idle = LOW
-  pinHigh(PIN_LATCH);
-  delayMicroseconds(2);
-
-  // release -> goes HIGH (via pull-up)
-  pinLow(PIN_LATCH);
-  delayMicroseconds(8); // hold HIGH briefly to latch
-  // drive low again to return to idle
-  pinHigh(PIN_LATCH);
-  delayMicroseconds(4);
-  // release to leave in high-Z (optional)
-  pinLow(PIN_LATCH);
-}
-
-
-
+/// @brief  Send 16 bits to display: two digits + minus + celsius
+/// @param digit1   First digit segments array (7 bools)
+/// @param digit2   Second digit segments array (7 bools)
+/// @param minus    Minus sign segment (bool)
+/// @param celsius  Celsius sign segment (bool)
 void sendBitsArray(const bool *digit1, const bool *digit2, bool minus, bool celsius)
 {
   // ensure latch idle low before starting
-  pinLow(PIN_LATCH);
+  setPinLow(PIN_LATCH);
   delayMicroseconds(4);
 
   for (int i = 0; i < 7; ++i)
@@ -122,7 +120,7 @@ void sendBitsArray(const bool *digit1, const bool *digit2, bool minus, bool cels
   delayMicroseconds(1);
   pulseClock();
 
-  setDataBit(celsius);  
+  setDataBit(celsius);
   delayMicroseconds(1);
   pulseClock();
 
@@ -130,10 +128,12 @@ void sendBitsArray(const bool *digit1, const bool *digit2, bool minus, bool cels
   pulseLatch();
 
   // release data line
-  pinHigh(PIN_DATA);
+  setPinHigh(PIN_DATA);
 }
 
-void sendNumber(int num)
+/// @brief  Set display to integer number (-99..99)
+/// @param num   Integer number to display
+void setOutdoorDisplay(int num)
 {
   bool minus = false;
   if (num < 0)
@@ -144,59 +144,187 @@ void sendNumber(int num)
   int digit1 = num / 10;
   int digit2 = num % 10;
 
-  if(digit1 == 0)
+  if (digit1 == 0)
     digit1 = 10; // NULL for leading zero
 
-  sendBitsArray(frame1[digit1], frame2[digit2], minus, true);
+  sendBitsArray(DIGIT_1[digit1], DIGIT_2[digit2], minus, true);
+}
+
+/// @brief  Set display to NULL (all segments off)
+/// @param data  String data ( "NULL" , "--" )
+void setOutdoorDisplay(const String &data)
+{
+  // send NULL display
+  switch (data[0])
+  {
+  case 'NULL':
+    sendBitsArray(DIGIT_1[DISPLAY_NULL_IDX], DIGIT_2[DISPLAY_NULL_IDX], false, true);
+    break;
+  case '--':
+    sendBitsArray(DIGIT_1[DISPLAY_SIGN_MINUS_IDX], DIGIT_2[DISPLAY_SIGN_MINUS_IDX], false, true);
+    break;
+  default:
+    sendBitsArray(DIGIT_1[DISPLAY_NULL_IDX], DIGIT_2[DISPLAY_NULL_IDX], false, true);
+  }
+}
+
+/// @brief  Animate display with index
+/// @param idx  Index of animation frame (0..5)
+void setOutdoorDisplay_animate(int idx)
+{
+  sendBitsArray(DIGIT_1[idx + 12], DIGIT_2[idx + 12], false, false);
+}
+
+void server_handleRoot()
+{
+  String html =
+      "<!DOCTYPE html><html><head>"
+      "<meta charset='utf-8'>"
+      "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
+      "<title>Outdoor Temp</title>"
+
+      "<style>"
+      "body{font-family:Arial,sans-serif;background:#f2f2f2;margin:0;padding:0;}"
+      ".card{max-width:360px;margin:40px auto;background:#fff;"
+      "padding:20px;border-radius:12px;box-shadow:0 4px 10px rgba(0,0,0,.1);}"
+      "h2{text-align:center;margin-top:0;}"
+      ".temp{font-size:48px;text-align:center;margin:20px 0;}"
+      "form{display:flex;flex-direction:column;gap:15px;}"
+      "input[type=number]{font-size:20px;padding:12px;border-radius:8px;border:1px solid #ccc;}"
+      "input[type=submit]{font-size:20px;padding:12px;border-radius:8px;"
+      "border:none;background:#007bff;color:white;cursor:pointer;}"
+      "input[type=submit]:active{background:#0056b3;}"
+      "</style>"
+
+      "</head><body>"
+
+      "<div class='card'>"
+      "<h2>Outdoor Temperature</h2>"
+      "<div class='temp'>" +
+      String(currentTemp) + " &deg;C</div>"
+
+                            "<form action='/set'>"
+                            "<input type='number' name='temp' min='-99' max='99' placeholder='Enter temperature' required>"
+                            "<input type='submit' value='Set temperature'>"
+                            "</form>"
+                            "</div>"
+
+                            "</body></html>";
+
+  server.send(200, "text/html", html);
+}
+
+void server_handleSet()
+{
+  if (!server.hasArg("temp"))
+  {
+    server.send(400, "text/plain", "Missing temp");
+    return;
+  }
+
+  int temp = server.arg("temp").toInt();
+
+  if (temp < -99 || temp > 99)
+  {
+    server.send(400, "text/plain", "Out of range");
+    return;
+  }
+
+  currentTemp = temp;
+  setOutdoorDisplay(currentTemp);
+
+  server.sendHeader("Location", "/");
+  server.send(302);
+}
+
+// ----- open-drain helpers -----
+inline void setPinLow(int pin)
+{
+  pinMode(pin, OUTPUT);
+  digitalWrite(pin, LOW);
+}
+
+inline void setPinHigh(int pin)
+{
+  pinMode(pin, INPUT); // high-Z, pull-up will pull line HIGH
+}
+
+/// @brief Set data line according to logical bit and BIT_ON_HIGH polarity
+/// @param bit  Logical bit to send (0/1)
+inline void setDataBit(uint8_t bit)
+{  
+  bool wantHigh = (bit != 0) ? true : false;
+  if (wantHigh)
+    setPinHigh(PIN_DATA);
+  else
+    setPinLow(PIN_DATA);
+}
+
+/// @brief  Pulse clock line (LOW->HIGH->LOW)
+inline void pulseClock()
+{
+  const unsigned int T_HALF_US = 5; // half clock period in microseconds (5 -> ~100 kHz)
+  setPinHigh(PIN_CLOCK);
+  delayMicroseconds(T_HALF_US);
+  setPinLow(PIN_CLOCK);
+  delayMicroseconds(T_HALF_US);
+}
+
+/// @brief  Pulse latch line to update display
+void pulseLatch()
+{
+  // ensure latch idle = LOW
+  setPinHigh(PIN_LATCH);
+  delayMicroseconds(2);
+
+  // release -> goes HIGH (via pull-up)
+  setPinLow(PIN_LATCH);
+  delayMicroseconds(8); // hold HIGH briefly to latch
+  // drive low again to return to idle
+  setPinHigh(PIN_LATCH);
+  delayMicroseconds(4);
+  // release to leave in high-Z (optional)
+  setPinLow(PIN_LATCH);
 }
 
 // initialize pins to safe released state
 void initPins()
 {
-  pinHigh(PIN_CLOCK);
-  pinHigh(PIN_DATA);
-  pinHigh(PIN_LATCH);
-
-  // optionally, ensure CLOCK/LATCH idle low - if you'd prefer idle low:
-  // pinDriveLow(PIN_CLOCK);
-  // pinDriveLow(PIN_LATCH);
+  setPinHigh(PIN_CLOCK);
+  setPinHigh(PIN_DATA);
+  setPinHigh(PIN_LATCH);
 }
 
-void setup()
-{
-  Serial.begin(115200);
-  initPins();
-  Serial.println();
-  Serial.println("ESP32 OUTDOOR DRIVER (open-drain) started");
-  Serial.print("BIT_ON_HIGH = ");
-  Serial.println(BIT_ON_HIGH ? "true (1 -> HIGH -> LED ON)" : "false (1 -> LOW -> LED ON)");
-  Serial.println("Sending example frame for 24°C every 500 ms");
-  delay(200);
-}
-
+const unsigned long TEMP_INTERVAL_MS = 10000; // 10 s
+unsigned long lastTempRead = 0;
 
 unsigned long lastSend = 0;
 const unsigned long SEND_INTERVAL_MS = 100;
 int TestNumber = -99;
 
-
-void loop()
+float getOutdoorTemperature()
 {
+  if (WiFi.status() != WL_CONNECTED)
+    return -102.0f; // error: no WiFi
 
-  unsigned long now = millis();
-  if (now - lastSend >= SEND_INTERVAL_MS)
+  HTTPClient http;
+  http.begin("http://192.168.1.35/json");
+  int httpCode = http.GET();
+
+  if (httpCode != 200)
   {
-    lastSend = now;
-    //sendBitsArray(frame24[IDX], 16);
-    //sendBitsArray(frame1[IDX], frame2[IDX], false, true);
-    sendNumber(TestNumber);
-
-    Serial.print("Sent number (");
-    Serial.print(TestNumber);
-    Serial.print(")");
-    Serial.println();
-    TestNumber++;
-    if (TestNumber > 99)
-      TestNumber = -99;
+    http.end();
+    return -101.0f; // error: HTTP fail
   }
+
+  String payload = http.getString();
+  http.end();
+
+  
+  int tPos = payload.indexOf("\"temperature\":");
+  if (tPos < 0)
+    return -101.0f; // error: no temperature field
+
+  float temp = payload.substring(tPos + 14).toFloat();
+  return temp; 
 }
