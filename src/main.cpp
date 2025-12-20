@@ -15,7 +15,6 @@
 const int PIN_LATCH = 2; // green
 const int PIN_DATA = 3;  // blue
 const int PIN_CLOCK = 4; // yellow
- 
 
 // ===== HTTP server =====
 WebServer server(80);
@@ -40,10 +39,11 @@ inline void setDataBit(uint8_t bit);
 inline void setPinHigh(int pin);
 inline void pulseClock();
 void pulseLatch();
+bool every30Seconds();
+bool everySecond();
 
 void sendBitsArray(const bool *digit1, const bool *digit2, bool minus, bool celsius);
 float getOutdoorTemperature();
-
 
 //-------------------------------------------------------------------------------------------------------
 
@@ -69,33 +69,42 @@ void setup()
     else
       setOutdoorDisplay("--");
   }
+  for (size_t i = 0; i < 6; i++) 
+  { 
+    setOutdoorDisplay_animate(i);
+    delay(500);
+  }
 }
 
 /// @brief Arduino main loop
 void loop()
 {
-  static int currentTemp = 0;
-  static unsigned long lastTempRead = 0;
-  const unsigned long TEMP_INTERVAL_MS = 30000; // 30 s
+  static unsigned long lastAnimate = 0;
   static int animate_idx = 0;
+  static bool isHttpError = false;
   server.handleClient();
-  unsigned long now = millis();
-  if (now - lastTempRead >= TEMP_INTERVAL_MS)
-  {
-    lastTempRead = now;
 
+  if (every30Seconds())
+  {
     float t = getOutdoorTemperature();
     if (t >= -60.0f && t <= 99.0f)
     {
-      currentTemp = (int)t;
+      currentTemp = t;
       animate_idx = 0;
       setOutdoorDisplay(currentTemp);
+      isHttpError = false;
     }
     else
     {
-      setOutdoorDisplay_animate(animate_idx);
-      animate_idx = (animate_idx + 1) % 6;
+      isHttpError = true;
     }
+  }
+
+  // animate only if HTTP error
+  if (isHttpError && everySecond())
+  {
+    setOutdoorDisplay_animate(animate_idx);
+    animate_idx = (animate_idx + 1) % 6;
   }
 }
 
@@ -164,13 +173,13 @@ void setOutdoorDisplay(int num)
 void setOutdoorDisplay(const String &data)
 {
   // send NULL display
-  if(data == "NULL")
+  if (data == "NULL")
   {
     sendBitsArray(DIGIT_1[DISPLAY_NULL_IDX], DIGIT_2[DISPLAY_NULL_IDX], false, true);
     return;
-  } 
+  }
   // send -- display
-  if(data == "--")
+  if (data == "--")
   {
     sendBitsArray(DIGIT_1[DISPLAY_SIGN_MINUS_IDX], DIGIT_2[DISPLAY_SIGN_MINUS_IDX], false, true);
     return;
@@ -265,7 +274,7 @@ inline void setPinHigh(int pin)
 /// @brief Set data line according to logical bit and BIT_ON_HIGH polarity
 /// @param bit  Logical bit to send (0/1)
 inline void setDataBit(uint8_t bit)
-{  
+{
   bool wantHigh = (bit != 0) ? true : false;
   if (wantHigh)
     setPinHigh(PIN_DATA);
@@ -328,11 +337,36 @@ float getOutdoorTemperature()
   String payload = http.getString();
   http.end();
 
-  
   int tPos = payload.indexOf("\"temperature\":");
   if (tPos < 0)
     return -101.0f; // error: no temperature field
 
   float temp = payload.substring(tPos + 14).toFloat();
-  return temp; 
+  return temp;
+}
+
+bool every30Seconds()
+{
+  static unsigned long lastMillis = 0;
+  unsigned long now = millis();
+
+  if (now - lastMillis >= 30000UL) // 30 s
+  {
+    lastMillis = now;
+    return true;
+  }
+  return false;
+}
+
+bool everySecond()
+{
+  static unsigned long lastMillis = 0;
+  unsigned long now = millis();
+
+  if (now - lastMillis >= 1000UL)
+  {
+    lastMillis = now;
+    return true;
+  }
+  return false;
 }
