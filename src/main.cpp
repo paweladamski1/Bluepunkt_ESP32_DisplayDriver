@@ -39,11 +39,13 @@ inline void setDataBit(uint8_t bit);
 inline void setPinHigh(int pin);
 inline void pulseClock();
 void pulseLatch();
-bool every30Seconds();
+bool every5Minuts(bool reset = false);
 bool everySecond();
+void WifiCheck();
+bool validateTemp(float t);
 
 void sendBitsArray(const bool *digit1, const bool *digit2, bool minus, bool celsius);
-float getOutdoorTemperature();
+float getOutdoorTemperature(const String &url);
 
 //-------------------------------------------------------------------------------------------------------
 
@@ -55,24 +57,17 @@ void setup()
   delay(200);
   WiFi.setHostname("esp_lcd_01");
   WiFi.begin(SSID, PASSWORD);
+
+  WifiCheck();
+
   server.on("/", server_handleRoot);
   server.on("/set", server_handleSet);
   server.begin();
 
-  int attempt = 0;
-  while (WiFi.status() != WL_CONNECTED)
+  for (size_t i = 0; i < 12; i++)
   {
-    delay(500);
-    attempt++;
-    if (attempt % 2 == 0)
-      setOutdoorDisplay("NULL");
-    else
-      setOutdoorDisplay("--");
-  }
-  for (size_t i = 0; i < 6; i++) 
-  { 
     setOutdoorDisplay_animate(i);
-    delay(500);
+    delay(100);
   }
 }
 
@@ -81,31 +76,52 @@ void loop()
 {
   static unsigned long lastAnimate = 0;
   static int animate_idx = 0;
-  static bool isHttpError = false;
+  static bool isError = false;
+  static bool firstRun = true;
+  static unsigned int retryCount = 4;
   server.handleClient();
 
-  if (every30Seconds())
+  if (every5Minuts() || firstRun)
   {
-    float t = getOutdoorTemperature();
-    if (t >= -60.0f && t <= 99.0f)
+    firstRun = false;
+    float t = 0;
+    t = getOutdoorTemperature("http://temperatura_na_balkonie.local/json");
+
+    if (validateTemp(t))
+      isError = false;
+    else
+    {
+      delay(1000);
+      t = getOutdoorTemperature("http://192.168.1.35/json");
+      if (validateTemp(t))
+        isError = false;
+      else
+        isError = true;
+    }
+
+    if (!isError)
     {
       currentTemp = t;
       animate_idx = 0;
+      retryCount = 0;
       setOutdoorDisplay(currentTemp);
-      isHttpError = false;
     }
     else
-    {
-      isHttpError = true;
-    }
+      retryCount++;
+    every5Minuts(true); // reset timer
   }
 
   // animate only if HTTP error
-  if (isHttpError && everySecond())
+  if (isError && everySecond() && retryCount > 3)
   {
     setOutdoorDisplay_animate(animate_idx);
-    animate_idx = (animate_idx + 1) % 6;
+    animate_idx = (animate_idx + 1) % 12;
   }
+}
+
+inline bool validateTemp(float t)
+{
+  return t >= -60.0f && t <= 99.0f;
 }
 
 /// @brief  Send 16 bits to display: two digits + minus + celsius
@@ -165,6 +181,11 @@ void setOutdoorDisplay(int num)
   if (digit1 == 0)
     digit1 = 10; // NULL for leading zero
 
+  if (minus && num > 0 && num < 10)
+  {
+    minus = false;
+    digit1 = DISPLAY_SIGN_MINUS_IDX; // show minus on first digit if only one digit negative
+  }
   sendBitsArray(DIGIT_1[digit1], DIGIT_2[digit2], minus, true);
 }
 
@@ -187,7 +208,7 @@ void setOutdoorDisplay(const String &data)
 }
 
 /// @brief  Animate display with index
-/// @param idx  Index of animation frame (0..5)
+/// @param idx  Index of animation frame (0..12)
 void setOutdoorDisplay_animate(int idx)
 {
   sendBitsArray(DIGIT_1[idx + 12], DIGIT_2[idx + 12], false, false);
@@ -319,13 +340,16 @@ void initPins()
 
 /// @brief Get outdoor temperature from HTTP server
 /// @return Temperature in Celsius or negative error code <= -100
-float getOutdoorTemperature()
+float getOutdoorTemperature(const String &url)
 {
   if (WiFi.status() != WL_CONNECTED)
+  {
+    WifiCheck();
     return -102.0f; // error: no WiFi
+  }
 
   HTTPClient http;
-  http.begin("http://192.168.1.35/json");
+  http.begin(url);
   int httpCode = http.GET();
 
   if (httpCode != 200)
@@ -341,16 +365,26 @@ float getOutdoorTemperature()
   if (tPos < 0)
     return -101.0f; // error: no temperature field
 
-  float temp = payload.substring(tPos + 14).toFloat();
-  return temp;
+  int valueStart = tPos + strlen("\"temperature\":");
+  int valueEnd = payload.indexOf(",", valueStart);
+  if (valueEnd == -1)
+    valueEnd = payload.indexOf("}", valueStart);
+
+  String tempStr = payload.substring(valueStart, valueEnd);
+  return tempStr.toFloat();
 }
 
-bool every30Seconds()
+bool every5Minuts(bool reset)
 {
   static unsigned long lastMillis = 0;
   unsigned long now = millis();
+  if (reset)
+  {
+    lastMillis = now;
+    return false;
+  }
 
-  if (now - lastMillis >= 30000UL) // 30 s
+  if (now - lastMillis >= 300000UL) // 5 minuts
   {
     lastMillis = now;
     return true;
@@ -369,4 +403,21 @@ bool everySecond()
     return true;
   }
   return false;
+}
+
+void WifiCheck()
+{
+  static int attempt = 0;
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    delay(500);
+    attempt++;
+    if (attempt % 2 == 0)
+      setOutdoorDisplay("NULL");
+    else
+      setOutdoorDisplay("--");
+    if (attempt >= 40) // after 20 seconds, restart
+      ESP.restart();
+  }
+  attempt = 0;
 }
