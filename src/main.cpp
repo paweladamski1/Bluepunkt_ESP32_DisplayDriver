@@ -42,6 +42,7 @@ void pulseLatch();
 bool every5Minuts(bool reset = false);
 bool everySecond();
 void WifiCheck();
+void animateStartLCD();
 bool validateTemp(float t);
 
 void sendBitsArray(const bool *digit1, const bool *digit2, bool minus, bool celsius);
@@ -54,16 +55,21 @@ float getOutdoorTemperature(const String &url);
 void setup()
 {
   initPins();
-  delay(200);
-  WiFi.setHostname("esp_lcd_01");
+  delay(2000);
+  WiFi.setHostname("BLAUEPUNKT-DISPLAY");
+  WiFi.setAutoConnect(true);
+  WiFi.setAutoReconnect(true);
+  WiFi.setSleep(false);
+  WiFi.mode(WIFI_STA);
   WiFi.begin(SSID, PASSWORD);
-
-  WifiCheck();
 
   server.on("/", server_handleRoot);
   server.on("/set", server_handleSet);
   server.begin();
+}
 
+void animateStartLCD()
+{
   for (size_t i = 0; i < 12; i++)
   {
     setOutdoorDisplay_animate(i);
@@ -76,10 +82,24 @@ void loop()
 {
   static unsigned long lastAnimate = 0;
   static int animate_idx = 0;
-  static bool isError = false;
+  static bool isThermometerError = false;
   static bool firstRun = true;
   static unsigned int retryCount = 4;
+  static bool wasWifiConnected = false;
   server.handleClient();
+
+  WifiCheck();
+
+  bool isWifiConnected = (WiFi.status() == WL_CONNECTED);
+  if (!wasWifiConnected && isWifiConnected)
+  {
+    firstRun = true; // on reconnect, read temp immediately
+    animateStartLCD();
+  }
+  wasWifiConnected = isWifiConnected;
+
+  if (!isWifiConnected)
+    return;
 
   if (every5Minuts() || firstRun)
   {
@@ -88,18 +108,17 @@ void loop()
     t = getOutdoorTemperature("http://temperatura_na_balkonie.local/json");
 
     if (validateTemp(t))
-      isError = false;
+      isThermometerError = false;
     else
     {
-      delay(1000);
       t = getOutdoorTemperature("http://192.168.1.35/json");
       if (validateTemp(t))
-        isError = false;
+        isThermometerError = false;
       else
-        isError = true;
+        isThermometerError = true;
     }
 
-    if (!isError)
+    if (!isThermometerError)
     {
       currentTemp = t;
       animate_idx = 0;
@@ -111,8 +130,8 @@ void loop()
     every5Minuts(true); // reset timer
   }
 
-  // animate only if HTTP error
-  if (isError && everySecond() && retryCount > 3)
+  // animate only if device error
+  if (isThermometerError && everySecond() && retryCount > 3)
   {
     setOutdoorDisplay_animate(animate_idx);
     animate_idx = (animate_idx + 1) % 12;
@@ -205,6 +224,48 @@ void setOutdoorDisplay(const String &data)
     sendBitsArray(DIGIT_1[DISPLAY_SIGN_MINUS_IDX], DIGIT_2[DISPLAY_SIGN_MINUS_IDX], false, true);
     return;
   }
+
+  if (data == "01")
+  {
+    sendBitsArray(DIGIT_1[0], DIGIT_2[1], false, false);
+    return;
+  }
+
+  if (data == "02")
+  {
+    sendBitsArray(DIGIT_1[0], DIGIT_2[2], false, false);
+    return;
+  }
+
+  if (data == "03")
+  {
+    sendBitsArray(DIGIT_1[0], DIGIT_2[3], false, false);
+    return;
+  }
+
+  if (data == "04")
+  {
+    sendBitsArray(DIGIT_1[0], DIGIT_2[4], false, false);
+    return;
+  }
+  if (data == "05")
+  {
+    sendBitsArray(DIGIT_1[0], DIGIT_2[5], false, false);
+    return;
+  }
+
+  if (data == "06")
+  {
+    sendBitsArray(DIGIT_1[0], DIGIT_2[6], false, false);
+    return;
+  }
+
+  if (data == "99")
+  {
+    sendBitsArray(DIGIT_1[9], DIGIT_2[9], false, false);
+    return;
+  }
+
 }
 
 /// @brief  Animate display with index
@@ -344,7 +405,6 @@ float getOutdoorTemperature(const String &url)
 {
   if (WiFi.status() != WL_CONNECTED)
   {
-    WifiCheck();
     return -102.0f; // error: no WiFi
   }
 
@@ -407,17 +467,76 @@ bool everySecond()
 
 void WifiCheck()
 {
-  static int attempt = 0;
-  while (WiFi.status() != WL_CONNECTED)
+  static unsigned long lastWifiCheck = 0;
+  static unsigned long lastReconnectAttempt = 0;
+  static unsigned long lastAnimToggle = 0;
+  static bool animState = false;
+
+  const unsigned long WIFI_CHECK_INTERVAL = 2000;
+  const unsigned long WIFI_RECONNECT_INTERVAL = 15000;
+  const unsigned long WIFI_ANIM_INTERVAL = 500;
+
+  unsigned long now = millis();
+
+  if (WiFi.status() != WL_CONNECTED)
   {
-    delay(500);
-    attempt++;
-    if (attempt % 2 == 0)
-      setOutdoorDisplay("NULL");
-    else
-      setOutdoorDisplay("--");
-    if (attempt >= 40) // after 20 seconds, restart
-      ESP.restart();
+    if (now - lastAnimToggle >= WIFI_ANIM_INTERVAL)
+    {
+      lastAnimToggle = now;
+      animState = !animState;
+
+      if (animState)
+        setOutdoorDisplay("--");
+      else
+        setOutdoorDisplay("NULL");
+    }
   }
-  attempt = 0;
+
+  if (now - lastWifiCheck < WIFI_CHECK_INTERVAL)
+    return;
+
+  lastWifiCheck = now;
+
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    if (now - lastReconnectAttempt >= WIFI_RECONNECT_INTERVAL)
+    {
+      lastReconnectAttempt = now;
+
+      WiFi.disconnect(true, true);
+      WiFi.mode(WIFI_OFF);
+      animateStartLCD();
+      setOutdoorDisplay("NULL");
+      delay(1500);
+      WiFi.mode(WIFI_STA);
+      WiFi.begin(SSID, PASSWORD);
+      delay(500);
+      wl_status_t st = WiFi.status();
+      if (st != WL_CONNECTED)
+      {
+        switch (st)
+        {
+        case WL_NO_SSID_AVAIL:
+          setOutdoorDisplay("01");
+          break;
+        case WL_CONNECT_FAILED:
+          setOutdoorDisplay("02");
+          break;
+        case WL_CONNECTION_LOST:
+          setOutdoorDisplay("03");
+          break;
+        case WL_DISCONNECTED:
+          setOutdoorDisplay("04");
+          break;
+        case WL_IDLE_STATUS:
+          setOutdoorDisplay("05");
+          break;
+        default:
+          setOutdoorDisplay("99");
+          break;
+        }
+        delay(2000);
+      }
+    }
+  }
 }
